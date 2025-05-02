@@ -2,4 +2,6 @@ flask
 python-dateutil
 IPy
 geoip2
-whois
+python-whois
+tldextract
+pandas

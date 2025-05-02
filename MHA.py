@@ -9,7 +9,10 @@ import re
 import socket
 import quopri
 import whois
-from flask import Flask, request, render_template_string, url_for
+from flask import (
+    Flask, request, render_template_string, url_for,
+    session, send_file, Response
+)
 from email.parser import HeaderParser
 from email.utils import parseaddr
 from dateutil import parser as date_parser
@@ -17,33 +20,37 @@ from typing import List, Dict, Optional
 import ipaddress
 import geoip2.database
 from collections import Counter
+import tldextract
+import io
+import csv
+import zipfile
+from datetime import timezone
 
 # -------- base directory (works in both normal & PyInstaller onefile) --------
 if getattr(sys, 'frozen', False):
-    # running in PyInstaller bundle
     BASE_DIR = sys._MEIPASS
 else:
-    # running in normal Python
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+DATA_DIR  = os.path.join(BASE_DIR, 'data')
 MMDB_PATH = os.path.join(DATA_DIR, 'GeoLite2-Country.mmdb')
 
-# ---------- HTML Template ----------
 TEMPLATE = '''
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mail Header Analyzer</title>
-  <!-- serve Tailwind locally -->
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mail Header Analyzer v0.2</title>
   <script src="{{ url_for('static', filename='tailwinds.16') }}"></script>
-  <!-- serve Chart.js locally -->
   <script src="{{ url_for('static', filename='chart.js') }}"></script>
+<style media="print">
+  @page { margin: 0; }
+  form, nav, #export-btn, #export-menu, #clear-btn { display: none !important; }
+  body { background: white; color: black; }
+</style>
+  <style>#drop-area.highlight{background:rgba(255,165,0,0.1);}</style>
 </head>
 <body class="bg-gray-900 text-gray-200">
-  <!-- Loading Overlay -->
   <div id="loading-overlay" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center hidden z-50">
     <svg class="animate-spin h-16 w-16 text-orange-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
       <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -51,67 +58,114 @@ TEMPLATE = '''
     </svg>
     <p class="mt-4 text-xl text-orange-400">Processing...</p>
   </div>
+
   <nav class="bg-gray-800 shadow">
     <div class="container mx-auto p-4 flex justify-between items-center">
       <h1 class="text-3xl font-bold text-orange-500">Mail Header Analyzer</h1>
-      <button id="export-btn" onclick="window.print()" class="px-4 py-2 bg-orange-500 text-gray-900 font-semibold rounded hover:bg-orange-600">Export PDF</button>
+      <div class="space-x-2 relative">
+        <button id="export-btn" class="px-4 py-2 bg-orange-500 text-gray-900 rounded hover:bg-orange-600">Export ▼</button>
+        <ul id="export-menu" class="absolute right-0 mt-2 w-40 bg-gray-800 border border-gray-700 rounded shadow-lg hidden">
+          <li><a href="{{ url_for('export', fmt='csv') }}" class="block px-4 py-2 hover:bg-gray-700">ZIP-CSV</a></li>
+          <li><a href="{{ url_for('export', fmt='md') }}"  class="block px-4 py-2 hover:bg-gray-700">Markdown</a></li>
+        </ul>
+        <button id="clear-btn" onclick="window.location='/'"
+                class="px-4 py-2 bg-gray-600 text-gray-200 rounded hover:bg-gray-700">Clear</button>
+        <button onclick="window.print()"
+                class="px-4 py-2 bg-gray-600 text-gray-200 rounded hover:bg-gray-700">Print / Save PDF</button>
+      </div>
     </div>
   </nav>
-  <main class="container mx-auto py-8 px-2">
-    <form id="analyze-form" method="post" class="mb-8" onsubmit="document.getElementById('loading-overlay').classList.remove('hidden')">
-      <textarea name="headers" class="w-full h-48 p-2 bg-gray-800 border border-gray-700 rounded text-gray-100" placeholder="Paste mail headers here" required>{{ request.form.get('headers','') }}</textarea>
+
+<main class="container mx-auto py-8 px-2
+             print:mx-0 print:px-0 print:max-w-none print:w-full">
+    <form id="analyze-form" method="post" enctype="multipart/form-data" class="mb-8"
+          onsubmit="document.getElementById('loading-overlay').classList.remove('hidden')">
+      <div id="drop-area" class="w-full p-4 mb-4 bg-gray-800 border-2 border-dashed border-gray-600 rounded text-center">
+        <p>Drag & Drop an .eml or .txt file here, or click to choose</p>
+        <input type="file" name="file" id="fileElem" accept=".eml,.txt" class="hidden">
+      </div>
+      <textarea id="headers" name="headers"
+                class="w-full h-48 p-2 bg-gray-800 border border-gray-700 rounded text-gray-100"
+                placeholder="Paste mail headers here"
+                required>{{ request.form.get('headers','') }}</textarea>
       <div class="mt-4">
         <button type="submit" class="px-4 py-2 bg-orange-500 text-gray-900 rounded hover:bg-orange-600">Analyze</button>
-        <button type="reset" class="ml-4 px-4 py-2 bg-gray-600 text-gray-200 rounded hover:bg-gray-700">Clear</button>
       </div>
     </form>
 
     {% if summary %}
+    <!-- Summary -->
     <section class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
-      <h2 class="text-2xl font-bold mb-4 text-orange-500">Summary</h2>
-      <dl class="grid grid-cols-1 md:grid-cols-2 gap-4 text-gray-200">
-        <div><dt class="font-medium">Date:</dt><dd>{{ summary.Date }}</dd></div>
-        <div><dt class="font-medium">Travel Time:</dt><dd>{{ total_delay }}</dd></div>
-        <div><dt class="font-medium">From:</dt><dd>{{ summary.From }}</dd></div>
-        <div><dt class="font-medium">To:</dt><dd>{{ summary.To }}</dd></div>
-        <div><dt class="font-medium">Subject:</dt><dd>{{ summary.Subject }}</dd></div>
-        <div><dt class="font-medium">SPF:</dt><dd>{{ summary.SPF or 'N/A' }}</dd></div>
-        <div><dt class="font-medium">Domain Registered:</dt><dd>{{ summary.whois_created or 'N/A' }}</dd></div>
-        <div><dt class="font-medium">DMARC:</dt><dd>{{ summary.DMARC or 'N/A' }}</dd></div>
-        <div><dt class="font-medium">Domain Updated:</dt><dd>{{ summary.whois_updated or 'N/A' }}</dd></div>
-        <div><dt class="font-medium">DKIM:</dt><dd>{{ summary.DKIM or 'N/A' }}</dd></div>
-      </dl>
+      <div class="text-gray-200 mb-4">
+        <div class="mb-2"><span class="font-medium">Date:</span> {{ summary.Date }}</div>
+        <div class="mb-2 grid grid-cols-2 gap-8">
+          <div><span class="font-medium">From:</span> {{ summary.From }}</div>
+          <div><span class="font-medium">To:</span> {{ summary.To }}</div>
+        </div>
+        <div class="mb-4"><span class="font-medium">Subject:</span> {{ summary.Subject }}</div>
+        <hr class="border-gray-700 mb-4">
+        <div class="grid grid-cols-2 gap-8">
+          <div>
+            <span class="font-medium"
+                  title="SPF (Sender Policy Framework): which servers may send on behalf of this domain"
+            >SPF:</span> {{ summary.SPF or 'N/A' }}
+          </div>
+          <div>
+            <span class="font-medium"
+                  title="Whois Created: when the sender’s domain was first registered"
+            >Whois Created:</span> {{ summary.whois_created or 'N/A' }}
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-8 mt-2">
+          <div>
+            <span class="font-medium"
+                  title="DMARC (Domain-based Message Authentication, Reporting & Conformance): policy for handling mail that fails SPF/DKIM"
+            >DMARC:</span> {{ summary.DMARC or 'N/A' }}
+          </div>
+          <div>
+            <span class="font-medium"
+                  title="Whois Updated: when the sender’s domain record was last modified"
+            >Whois Updated:</span> {{ summary.whois_updated or 'N/A' }}
+          </div>
+        </div>
+        <div class="mt-4">
+          <span class="font-medium"
+                title="DKIM (DomainKeys Identified Mail): cryptographic signature verifying message integrity"
+          >DKIM:</span> {{ summary.DKIM or 'N/A' }}
+        </div>
+      </div>
     </section>
+
     {% if whois_full %}
-    <section class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
-      <details class="bg-gray-800 rounded-lg">
-        <summary class="cursor-pointer text-2xl font-bold text-orange-500 mb-2">Full WHOIS</summary>
-        <pre class="whitespace-pre-wrap bg-gray-900 p-4 rounded text-gray-100">{{ whois_full }}</pre>
-      </details>
-    </section>
+    <details class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
+      <summary class="cursor-pointer text-2xl font-bold text-orange-500 mb-2">
+        Full WHOIS for Senders Domain
+      </summary>
+      <pre class="whitespace-pre-wrap bg-gray-900 p-4 rounded text-gray-100">{{ whois_full }}</pre>
+    </details>
     {% endif %}
     {% endif %}
 
     {% if entries %}
+    <!-- Hop Delays -->
     <section class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
       <h2 class="text-2xl font-semibold mb-4 text-orange-500">Hop Delays</h2>
       <div class="relative w-full h-64 mb-8">
         <canvas id="hopDelayChart" class="absolute inset-0"></canvas>
       </div>
     </section>
+    {% endif %}
+
+    {% if entries %}
+    <!-- Hop Journey -->
     <section class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
       <h2 class="text-2xl font-semibold mb-4 text-orange-500">Hop Journey</h2>
       <div class="overflow-auto">
         <table class="min-w-full table-auto border-collapse text-gray-100">
-          <thead class="bg-gray-700">
-            <tr>
-              <th class="px-4 py-2">Hop</th>
-              <th>From</th>
-              <th>By</th>
-              <th>Timestamp</th>
-              <th class="text-white">Delay</th>
-            </tr>
-          </thead>
+          <thead class="bg-gray-700"><tr>
+            <th class="px-4 py-2">Hop</th><th>From</th><th>By</th>
+            <th>Timestamp</th><th>Delay</th>
+          </tr></thead>
           <tbody>
             {% for e in entries %}
             <tr class="border-t border-gray-700">
@@ -119,7 +173,7 @@ TEMPLATE = '''
               <td class="px-4 py-2">{{ e.frm }}</td>
               <td class="px-4 py-2">{{ e.by }}</td>
               <td class="px-4 py-2">{{ e.timestamp }}</td>
-              <td class="px-4 py-2 text-white">{{ e.duration }}</td>
+              <td class="px-4 py-2">{{ e.duration }}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -129,20 +183,15 @@ TEMPLATE = '''
     {% endif %}
 
     {% if ips %}
+    <!-- Extracted IPs -->
     <section class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
       <h2 class="text-2xl font-semibold mb-4 text-orange-500">Extracted IPs</h2>
       <div class="overflow-auto">
         <table class="min-w-full table-auto border-collapse text-gray-100">
-          <thead class="bg-gray-700">
-            <tr>
-              <th class="px-4 py-2">IP Address</th>
-              <th>Count</th>
-              <th>Version</th>
-              <th>Type</th>
-              <th>rDNS</th>
-              <th>Country</th>
-            </tr>
-          </thead>
+          <thead class="bg-gray-700"><tr>
+            <th class="px-4 py-2">IP Address</th><th>Count</th>
+            <th>Version</th><th>Type</th><th>rDNS</th><th>Country</th>
+          </tr></thead>
           <tbody>
             {% for ip in ips %}
             <tr class="border-t border-gray-700">
@@ -161,21 +210,16 @@ TEMPLATE = '''
     {% endif %}
 
     {% if domains %}
+    <!-- Extracted Domains -->
     <section class="bg-gray-800 shadow-lg rounded-lg p-6 mb-8">
       <h2 class="text-2xl font-semibold mb-4 text-orange-500">Extracted Domains</h2>
       <div class="overflow-auto">
         <table class="min-w-full table-auto border-collapse text-gray-100">
-          <thead class="bg-gray-700">
-            <tr>
-              <th class="px-4 py-2">Domain</th>
-              <th>Count</th>
-            </tr>
-          </thead>
+          <thead class="bg-gray-700"><tr><th class="px-4 py-2">Domain</th><th>Count</th></tr></thead>
           <tbody>
             {% for d in domains %}
             <tr class="border-t border-gray-700">
-              <td class="px-4 py-2">{{ d.domain }}</td>
-              <td class="px-4 py-2">{{ d.count }}</td>
+              <td class="px-4 py-2">{{ d.domain }}</td><td class="px-4 py-2">{{ d.count }}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -185,17 +229,16 @@ TEMPLATE = '''
     {% endif %}
 
     {% if links %}
+    <!-- Extracted Links -->
     <section class="bg-gray-800 shadow-lg rounded-lg p-6">
       <h2 class="text-2xl font-semibold mb-4 text-orange-500">Extracted Links</h2>
-      <div class="w-full">
+      <div class="overflow-auto">
         <table class="table-fixed w-full border-collapse text-gray-100">
-          <thead class="bg-gray-700">
-            <tr>
-              <th class="w-1/4 px-2 py-1">Link Text</th>
-              <th class="w-3/4 px-2 py-1">URL</th>
-              <th class="w-16 px-2 py-1">Count</th>
-            </tr>
-          </thead>
+          <thead class="bg-gray-700"><tr>
+            <th class="w-1/4 px-2 py-1">Link Text</th>
+            <th class="w-3/4 px-2 py-1">URL</th>
+            <th class="w-16 px-2 py-1">Count</th>
+          </tr></thead>
           <tbody>
             {% for l in links %}
             <tr class="border-t border-gray-700">
@@ -209,20 +252,47 @@ TEMPLATE = '''
       </div>
     </section>
     {% endif %}
+
   </main>
 
   <script>
+    // Drag & Drop
+    const dropArea = document.getElementById('drop-area');
+    const fileElem = document.getElementById('fileElem');
+    dropArea.addEventListener('click', () => fileElem.click());
+    ['dragenter','dragover'].forEach(e =>
+      dropArea.addEventListener(e, ev => { ev.preventDefault(); dropArea.classList.add('highlight'); })
+    );
+    ['dragleave','drop'].forEach(e =>
+      dropArea.addEventListener(e, ev => { ev.preventDefault(); dropArea.classList.remove('highlight'); })
+    );
+    dropArea.addEventListener('drop', ev => {
+      const f = ev.dataTransfer.files[0], r = new FileReader();
+      r.onload = e => document.getElementById('headers').value = e.target.result;
+      r.readAsText(f);
+    });
+
+    // Export menu toggle
+    document.getElementById('export-btn').addEventListener('click', () => {
+      document.getElementById('export-menu').classList.toggle('hidden');
+    });
+
     {% if entries %}
-    const ctx = document.getElementById('hopDelayChart').getContext('2d');
-    const hops = {{ entries|tojson }};
+    // Chart.js Hop Delays
+    const ctx = document.getElementById('hopDelayChart').getContext('2d'),
+          hops = {{ entries|tojson }};
     new Chart(ctx, {
       type: 'bar',
       data: {
         labels: hops.map(h => `Hop ${h.hop}`),
-        datasets: [{ label: 'Delay (s)', data: hops.map(h => h.delay_secs), barThickness: 20 }]
+        datasets: [{ data: hops.map(h => h.delay_secs), barThickness: 20 }]
       },
-      options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-        scales: { x: { beginAtZero: true, suggestedMax: {{ max_delay }} }, y: { ticks: { color: '#fff' } } },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { beginAtZero: true, suggestedMax: {{ max_delay }} },
+          y: { ticks: { color: '#fff' } }
+        },
         plugins: { legend: { display: false } }
       }
     });
@@ -247,80 +317,102 @@ def _format_duration(seconds: int) -> str:
     return ' '.join(parts) or '0sec'
 
 def parse_summary(raw: str) -> Dict[str, str]:
-    headers = HeaderParser().parsestr(raw)
-    summary = {'From':'','To':'','Subject':'','Date':''}
-    summary.update({k: headers.get(k, '') for k in summary})
-    summary.update({'SPF': None, 'DKIM': None, 'DMARC': None})
-    for auth in headers.get_all('Authentication-Results', []):
-        if m := re.search(r'spf=(pass|fail|neutral|softfail|temperror|permerror)', auth, re.I):
-            summary['SPF'] = m.group(1).lower()
-        if m := re.search(r'dkim=(pass|fail|neutral|policy|none)', auth, re.I):
-            summary['DKIM'] = m.group(1).lower()
-        if m := re.search(r'dmarc=(pass|fail|bestguess|none)', auth, re.I):
-            summary['DMARC'] = m.group(1).lower()
-    if not summary['SPF'] and headers.get('Received-SPF'):
-        summary['SPF'] = headers.get('Received-SPF').split()[0]
-    return summary
+    hdr = HeaderParser().parsestr(raw)
+    s = {'From':'','To':'','Subject':'','Date':''}
+    s.update({k: hdr.get(k,'') for k in s})
+    s.update({'SPF':None,'DKIM':None,'DMARC':None,'whois_created':None,'whois_updated':None})
+    
+        # --- normalize the Date header to UTC ISO format ---
+    raw_date = s['Date']
+    try:
+        dt = date_parser.parse(raw_date, fuzzy=True)
+        # if there's no tzinfo, assume it's already UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        # convert to UTC (all good if already UTC)
+        dt_utc = dt.astimezone(timezone.utc)
+        s['Date'] = dt_utc.isoformat()   # e.g. "2025-05-01T23:44:50+00:00"
+    except Exception:
+        # leave s['Date'] as original if parsing fails
+        pass
+        
+    for auth in hdr.get_all('Authentication-Results',[]):
+        if m:=re.search(r'spf=(pass|fail|neutral|softfail|temperror|permerror)',auth,re.I):
+            s['SPF']=m.group(1).lower()
+        if m:=re.search(r'dkim=(pass|fail|neutral|policy|none)',auth,re.I):
+            s['DKIM']=m.group(1).lower()
+        if m:=re.search(r'dmarc=(pass|fail|bestguess|none)',auth,re.I):
+            s['DMARC']=m.group(1).lower()
+    if not s['SPF'] and hdr.get('Received-SPF'):
+        s['SPF']=hdr.get('Received-SPF').split()[0]
+    return s
 
 def parse_received(raw: str) -> List[Dict]:
-    headers = HeaderParser().parsestr(raw)
-    recs = headers.get_all('Received') or []
+    hdr = HeaderParser().parsestr(raw)
+    recs = hdr.get_all('Received') or []
     recs.reverse()
-    hops = []
-    prev_ts: Optional[float] = None
-
-    for idx, r in enumerate(recs, start=1):
-        parts = r.rsplit(';', 1)
-        raw_ts = parts[-1].strip() if parts[-1] else ''
+    hops, prev_ts = [], None
+    for idx, r in enumerate(recs,1):
+        parts = r.rsplit(';',1)
+        ts_raw = parts[-1].strip() if parts[-1] else ''
         try:
-            dt = date_parser.parse(raw_ts, fuzzy=True)
-            iso_ts = dt.isoformat()
-            ts_val = dt.timestamp()
+            dt = date_parser.parse(ts_raw, fuzzy=True)
+            # assume UTC if parser gives a naive datetime
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            # convert everything to UTC
+            dt_utc = dt.astimezone(timezone.utc)
+            iso = dt_utc.isoformat()        # "YYYY-MM-DDTHH:MM:SS+00:00"
+            ts  = int(dt_utc.timestamp())   # seconds since epoch UTC
         except Exception:
-            iso_ts = raw_ts
-            ts_val = None
+            iso, ts = ts_raw, None
 
-        if prev_ts is not None and ts_val is not None:
-            delay = int(ts_val - prev_ts) if ts_val > prev_ts else 0
-        else:
-            delay = 0
-
-        prev_ts = ts_val if ts_val is not None else prev_ts
+        delay = int(ts - prev_ts) if prev_ts and ts and ts > prev_ts else 0
+        prev_ts = ts or prev_ts
 
         m = re.search(r'from\s+(.*?)\s+by\s+(.*?)(?:\s|$)', parts[0], re.I)
-        frm, by = (m.group(1), m.group(2)) if m else ('','')
+        frm, by = (m.group(1), m.group(2)) if m else ('', '')
 
         hops.append({
             'hop': idx,
             'frm': frm,
             'by': by,
-            'timestamp': iso_ts,
+            'timestamp': iso,
             'duration': _format_duration(delay),
             'delay_secs': delay
         })
 
     return hops
 
+
 def extract_ips(raw: str) -> List[Dict]:
     joined = re.sub(r'=\r?\n', '', raw)
-    decoded = quopri.decodestring(joined).decode('utf-8', errors='ignore')
-    ipv4_re = re.compile(
-        r'(?<![\d.])((?:25[0-5]|2[0-4]\d|[01]?\d?\d)'
-        r'(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})(?![\d.])'
-    )
-    ipv6_re = re.compile(
-        r'(?<![0-9A-Fa-f:])((?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![0-9A-Fa-f:])'
-    )
-    found = [ip for rgx in (ipv4_re, ipv6_re) for ip in rgx.findall(decoded)]
-    counts = Counter(found)
+    joined_bytes = joined.encode('utf-8', errors='ignore')
+    decoded_bytes = quopri.decodestring(joined_bytes)
+    decoded = decoded_bytes.decode('utf-8', errors='ignore')
+    #decoded = quopri.decodestring(joined).decode('utf-8', errors='ignore')
 
+    ipv4_re = re.compile(
+        r'(?<![\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'
+        r'(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\d.])'
+    )
+    ipv6_re = re.compile(r'\[?([a-fA-F0-9:]+:+[a-fA-F0-9:%]+)\]?')
+
+    found = []
+    for regex in (ipv4_re, ipv6_re):
+        for ip in regex.findall(decoded):
+            ip_clean = ip.split('%')[0]
+            try:
+                obj = ipaddress.ip_address(ip_clean)
+                found.append(obj.exploded)
+            except ValueError:
+                continue
+
+    counts = Counter(found)
     reader = geoip2.database.Reader(MMDB_PATH)
-    results = []
+    out = []
     for ip_str, cnt in counts.items():
-        try:
-            obj = ipaddress.ip_address(ip_str)
-        except:
-            continue
+        obj = ipaddress.ip_address(ip_str)
         rdns = None
         try:
             rdns = socket.gethostbyaddr(ip_str)[0]
@@ -332,7 +424,7 @@ def extract_ips(raw: str) -> List[Dict]:
                 country = reader.country(ip_str).country.name
             except:
                 pass
-        results.append({
+        out.append({
             'address': ip_str,
             'count': cnt,
             'version': obj.version,
@@ -341,34 +433,56 @@ def extract_ips(raw: str) -> List[Dict]:
             'country': country
         })
     reader.close()
-    return results
+    return out
 
-def extract_links(raw: str) -> List[Dict]:
-    joined = re.sub(r'=\r?\n', '', raw)
-    decoded = quopri.decodestring(joined).decode('utf-8', errors='ignore')
-    links = [{'text': m.group(2), 'url': m.group(1)}
-             for m in re.finditer(r'<a[^>]*href=["\'](.*?)["\'][^>]*>(.*?)</a>', decoded, re.I)]
-    for m in re.finditer(r'(https?://[^\s<>"\']+)', decoded):
-        url = m.group(1)
-        if not any(l['url'] == url for l in links):
-            links.append({'text': url, 'url': url})
-    counts = Counter(l['url'] for l in links)
-    uniq = []
-    for l in links:
-        if not any(u['url'] == l['url'] for u in uniq):
-            uniq.append({'text': l['text'], 'url': l['url'], 'count': counts[l['url']]})
-    return uniq
 
 def extract_domains(raw: str) -> List[Dict]:
     joined = re.sub(r'=\r?\n', '', raw)
-    decoded = quopri.decodestring(joined).decode('utf-8', errors='ignore')
+    joined_bytes = joined.encode('utf-8', errors='ignore')
+    decoded_bytes = quopri.decodestring(joined_bytes)
+    decoded = decoded_bytes.decode('utf-8', errors='ignore')
+    #decoded = quopri.decodestring(joined).decode('utf-8', errors='ignore')
     email_domains = re.findall(r'[\w\.-]+@([\w\.-]+)', decoded)
     url_domains = re.findall(r'https?://([\w\.-]+)', decoded)
     counts = Counter(email_domains + url_domains)
     return [{'domain': dom, 'count': cnt} for dom, cnt in counts.items()]
 
+
+def extract_links(raw: str) -> List[Dict]:
+    joined = re.sub(r'=\r?\n', '', raw)
+    joined_bytes = joined.encode('utf-8', errors='ignore')
+    decoded_bytes = quopri.decodestring(joined_bytes)
+    decoded = decoded_bytes.decode('utf-8', errors='ignore')
+    #decoded = quopri.decodestring(joined).decode('utf-8', errors='ignore')
+
+    links = [
+        {'text': m.group(2), 'url': m.group(1)}
+        for m in re.finditer(
+            r'<a[^>]*href=["\'](.*?)["\'][^>]*>(.*?)</a>',
+            decoded,
+            re.I
+        )
+    ]
+    for m in re.finditer(r'(https?://[^\s<>"\']+)', decoded):
+        url = m.group(1)
+        if not any(l['url'] == url for l in links):
+            links.append({'text': url, 'url': url})
+
+    counts = Counter(l['url'] for l in links)
+    uniq = []
+    for l in links:
+        if not any(u['url'] == l['url'] for u in uniq):
+            uniq.append({
+                'text': l['text'],
+                'url': l['url'],
+                'count': counts[l['url']]
+            })
+    return uniq
+
+
 def create_app() -> Flask:
     app = Flask(__name__, static_folder=DATA_DIR, static_url_path='/static')
+    app.secret_key = os.urandom(24)
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s'))
     app.logger.addHandler(handler)
@@ -377,42 +491,61 @@ def create_app() -> Flask:
     @app.route('/', methods=['GET', 'POST'])
     def index():
         summary, entries, ips, domains, links = {}, [], [], [], []
-        total_delay, max_delay = '', 0
-        whois_full = None
+        total_delay, max_delay, whois_full = '', 0, None
 
         if request.method == 'POST':
-            raw = request.form['headers']
-            summary = parse_summary(raw)
+            # Load raw headers
+            if 'file' in request.files and request.files['file'].filename:
+                raw = request.files['file'].read().decode('utf-8', errors='ignore')
+            else:
+                raw = request.form['headers']
 
-            # WHOIS lookup
+            # Parse
+            summary = parse_summary(raw)
+            entries = parse_received(raw)
+            ips     = extract_ips(raw)
+            domains = extract_domains(raw)
+            links   = extract_links(raw)
+
+            if entries:
+                total_delay = _format_duration(sum(e['delay_secs'] for e in entries))
+                max_delay   = max(e['delay_secs'] for e in entries)
+
+            # WHOIS
             email_addr = parseaddr(summary['From'])[1]
-            full_dom = email_addr.split('@', 1)[1] if '@' in email_addr else None
-            if full_dom:
-                parts = full_dom.split('.')
-                whois_dom = '.'.join(parts[-2:]) if len(parts) >= 2 else full_dom
+            dom = email_addr.split('@', 1)[1] if '@' in email_addr else None
+            if dom:
+                ext = tldextract.extract(dom)
+                whois_dom = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
                 try:
                     w = whois.whois(whois_dom)
                     whois_full = getattr(w, 'text', None) or '\n'.join(f"{k}: {v}" for k, v in w.items())
-                    for key, val in (('whois_created', w.creation_date), ('whois_updated', w.updated_date)):
-                        if val:
-                            dt = val[0] if isinstance(val, list) else val
-                            if isinstance(dt, str):
-                                dt = date_parser.parse(dt)
-                            summary[key] = dt.isoformat()
+                    for key, val in (('whois_created', w.creation_date),
+                                     ('whois_updated', w.updated_date)):
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                        if isinstance(val, str):
+                            try:
+                                val = date_parser.parse(val)
+                            except:
+                                val = None
+                        if hasattr(val, 'isoformat'):
+                            if val.tzinfo is None:
+                                val = val.replace(tzinfo=timezone.utc)
+                            summary[key] = val.astimezone(timezone.utc).isoformat()
                         else:
                             summary[key] = None
-                except Exception:
-                    app.logger.exception(f"WHOIS failed for {whois_dom}")
+                except Exception as e:
+                    app.logger.warning(f"WHOIS failed for {whois_dom}: {e}")
                     summary['whois_created'] = None
                     summary['whois_updated'] = None
 
-            entries = parse_received(raw)
-            ips = extract_ips(raw)
-            domains = extract_domains(raw)
-            links = extract_links(raw)
-            if entries:
-                total_delay = _format_duration(sum(e['delay_secs'] for e in entries))
-                max_delay = max(e['delay_secs'] for e in entries)
+            # Save for export
+            session['export_summary'] = summary
+            session['export_entries'] = entries
+            session['export_ips']     = ips
+            session['export_domains'] = domains
+            session['export_links']   = links
 
         return render_template_string(
             TEMPLATE,
@@ -426,17 +559,113 @@ def create_app() -> Flask:
             whois_full=whois_full
         )
 
+    @app.route('/export/<fmt>')
+    def export(fmt):
+        summary = session.get('export_summary', {})
+        entries = session.get('export_entries', [])
+        ips     = session.get('export_ips', [])
+        domains = session.get('export_domains', [])
+        links   = session.get('export_links', [])
+
+        # CSV → ZIP
+        if fmt == 'csv':
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(['Field', 'Value'])
+                for key in ['Date','From','To','Subject','DKIM','DMARC','SPF','whois_created','whois_updated']:
+                    w.writerow([key, summary.get(key, '')])
+                z.writestr('summary.csv', buf.getvalue())
+
+                if entries:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(entries[0].keys())
+                    for e in entries:
+                        w.writerow(e.values())
+                    z.writestr('hops.csv', buf.getvalue())
+
+                if ips:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(ips[0].keys())
+                    for i in ips:
+                        w.writerow(i.values())
+                    z.writestr('ips.csv', buf.getvalue())
+
+                if domains:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(domains[0].keys())
+                    for d in domains:
+                        w.writerow(d.values())
+                    z.writestr('domains.csv', buf.getvalue())
+
+                if links:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(links[0].keys())
+                    for l in links:
+                        w.writerow(l.values())
+                    z.writestr('links.csv', buf.getvalue())
+
+            mem.seek(0)
+            return send_file(
+                mem,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='analysis_csvs.zip'
+            )
+
+        # Markdown
+        if fmt == 'md':
+            lines = ['# Mail Header Analysis', '', '## Summary', '| Field | Value |', '|---|---|']
+            for key in ['Date','From','To','Subject','DKIM','DMARC','SPF','whois_created','whois_updated']:
+                lines.append(f"| {key} | {summary.get(key,'')} |")
+            lines.append('')
+            if entries:
+                lines += ['', '## Hop Journey', '| Hop | From | By | Timestamp | Delay |', '|---|---|---|---|---|']
+                for e in entries:
+                    lines.append(f"| {e['hop']} | {e['frm']} | {e['by']} | {e['timestamp']} | {e['duration']} |")
+            lines.append('')
+            if ips:
+                lines += ['', '## Extracted IPs', '| IP | Count | Version | Type | rDNS | Country |', '|---|---|---|---|---|---|']
+                for i in ips:
+                    lines.append(f"| {i['address']} | {i['count']} | {i['version']} | {i['type']} | {i['rdns'] or ''} | {i['country'] or ''} |")
+            lines.append('')
+            if domains:
+                lines += ['', '## Extracted Domains', '| Domain | Count |', '|---|---|']
+                for d in domains:
+                    lines.append(f"| {d['domain']} | {d['count']} |")
+            lines.append('')
+            if links:
+                lines += ['', '## Extracted Links', '| Text | URL | Count |', '|---|---|---|']
+                for l in links:
+                    lines.append(f"| {l['text']} | {l['url']} | {l['count']} |")
+            md = '\n'.join(lines)
+            return Response(
+                md,
+                mimetype='text/markdown',
+                headers={'Content-Disposition':'attachment; filename=analysis.md'}
+            )
+
+        return "Unsupported format", 400
+
     return app
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Mail Header Analyzer')
-    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('-b', '--bind', default='127.0.0.1', help='Bind address')
-    parser.add_argument('-p', '--port', type=int, default=8080, help='Port number')
+    parser.add_argument('-d','--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('-b','--bind', default='127.0.0.1', help='Bind address')
+    parser.add_argument('-p','--port', type=int, default=8080, help='Port number')
     args = parser.parse_args()
 
     app = create_app()
     if args.debug:
         app.debug = True
+
     threading.Timer(1, lambda: webbrowser.open_new(f"http://{args.bind}:{args.port}/")).start()
     app.run(host=args.bind, port=args.port, use_reloader=False)
+
