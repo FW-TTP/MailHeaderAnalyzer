@@ -38,7 +38,7 @@ A lightweight Flask-based web application for parsing and visualizing email head
 ## Prerequisites
 
 - Python 3.7+
-- [GeoLite2 Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) database (place `GeoLite2-Country.mmdb` in `data/`)
+- [GeoLite2 Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) database (you must register, download the `GeoLite2-Country.mmdb` database, and placev in `data/`)
 - (Optional) A virtual environment tool (e.g. `venv` or `virtualenv`)
 
 ---
