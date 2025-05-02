@@ -54,7 +54,7 @@ python3 mha.py
 ## Build with Pyinstaller
   
    ```bash
-pyinstaller --onefile --add-data "data;data"  --add-data "$(python3 -c 'import whois, os; print(os.path.join(os.path.dirname(whois.__file__), \"data\"))'):whois/data" mha.py
+pyinstaller --onefile --add-data "data;data" --add-data "$(python3 -c 'import whois, os; print(os.path.join(os.path.dirname(whois.__file__), \"data\"))'):whois/data" mha.py
    ```
 ---
 
