@@ -18,8 +18,8 @@ A lightweight Flask-based web application for parsing and visualizing email head
 
 
 
-- **Beautiful, responsive UI** with Tailwind CSS and Chart.js.
-- **One-click PDF export** via the browser’s print-to-PDF.
+- **User friendly, responsive UI** with Tailwind CSS and Chart.js.
+- **PDF / CSV / MD** export.
 
 **Header parsing / Date/time parsing / WHOIS lookups**
 ![Screenshot of Mail Header Analyzer UI](images/1.png)
