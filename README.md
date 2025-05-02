@@ -47,7 +47,7 @@ Run the app with default settings:
 python3 mha.py
 ```
 - Open your browser at [http://127.0.0.1:8080](http://127.0.0.1:8080).
-- Paste your raw email headers into the textarea and click **Analyze**.
+- Paste your raw email headers into the textarea or drag EML or TXT file into the selection field and click **Analyze**.
 - Click **Export** to export data in different formats.
 ---
 
