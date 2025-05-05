@@ -5,3 +5,4 @@ geoip2
 python-whois
 tldextract
 pandas
+extract_msg
