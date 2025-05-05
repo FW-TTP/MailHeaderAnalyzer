@@ -40,7 +40,7 @@ TEMPLATE = '''
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mail Header Analyzer v0.2</title>
+  <title>Mail Header Analyzer v0.3</title>
   <script src="{{ url_for('static', filename='tailwinds.16') }}"></script>
   <script src="{{ url_for('static', filename='chart.js') }}"></script>
 <style media="print">
@@ -61,7 +61,7 @@ TEMPLATE = '''
 
   <nav class="bg-gray-800 shadow">
     <div class="container mx-auto p-4 flex justify-between items-center">
-      <h1 class="text-3xl font-bold text-orange-500">Mail Header Analyzer</h1>
+      <h1 class="text-3xl font-bold text-orange-500">Mail Header Analyzer v0.3</h1>
       <div class="space-x-2 relative">
         <button id="export-btn" class="px-4 py-2 bg-orange-500 text-gray-900 rounded hover:bg-orange-600">Export ▼</button>
         <ul id="export-menu" class="absolute right-0 mt-2 w-40 bg-gray-800 border border-gray-700 rounded shadow-lg hidden">
@@ -81,13 +81,15 @@ TEMPLATE = '''
     <form id="analyze-form" method="post" enctype="multipart/form-data" class="mb-8"
           onsubmit="document.getElementById('loading-overlay').classList.remove('hidden')">
       <div id="drop-area" class="w-full p-4 mb-4 bg-gray-800 border-2 border-dashed border-gray-600 rounded text-center">
-        <p>Drag & Drop an .eml or .txt file here, or click to choose</p>
-        <input type="file" name="file" id="fileElem" accept=".eml,.txt" class="hidden">
+              <p>Drag & Drop an .eml, .txt, or .msg file here, or click to choose</p>
+        <input type="file" name="file" id="fileElem" accept=".eml,.txt,.msg" class="hidden">
       </div>
+
       <textarea id="headers" name="headers"
                 class="w-full h-48 p-2 bg-gray-800 border border-gray-700 rounded text-gray-100"
                 placeholder="Paste mail headers here"
                 required>{{ request.form.get('headers','') }}</textarea>
+                
       <div class="mt-4">
         <button type="submit" class="px-4 py-2 bg-orange-500 text-gray-900 rounded hover:bg-orange-600">Analyze</button>
       </div>
@@ -266,11 +268,39 @@ TEMPLATE = '''
     ['dragleave','drop'].forEach(e =>
       dropArea.addEventListener(e, ev => { ev.preventDefault(); dropArea.classList.remove('highlight'); })
     );
-    dropArea.addEventListener('drop', ev => {
-      const f = ev.dataTransfer.files[0], r = new FileReader();
-      r.onload = e => document.getElementById('headers').value = e.target.result;
-      r.readAsText(f);
-    });
+     dropArea.addEventListener('drop', ev => {
+       ev.preventDefault();
+       dropArea.classList.remove('highlight');
+       const files = ev.dataTransfer.files;
+       if (!files.length) return;
+       const ext = files[0].name.split('.').pop().toLowerCase();
+       const headersEl = document.getElementById('headers');
+
+       // build a new FileList so fileElem.files = ... actually works
+       const dt = new DataTransfer();
+       for (const f of files) dt.items.add(f);
+       fileElem.files = dt.files;
+
+       if (ext === 'msg') {
+         // .msg goes straight to the server—clear textarea and show notice
+         headersEl.value = '';
+         headersEl.removeAttribute('required');
+        headersEl.setAttribute(
+          'placeholder',
+          `Loaded ${files[0].name}. Click “Analyze” to parse headers.`
+        );
+         document.getElementById('file-info').textContent =
+           `Loaded ${files[0].name}. Click “Analyze” to parse headers.`;
+       } else {
+         // inline‐read .eml / .txt
+         const reader = new FileReader();
+         reader.onload = e => { headersEl.value = e.target.result; };
+         reader.readAsText(files[0]);
+         document.getElementById('file-info').textContent = '';
+          headersEl.setAttribute('required','required');
+          headersEl.setAttribute('placeholder','Paste mail headers here');
+       }
+     });
 
     // Export menu toggle
     document.getElementById('export-btn').addEventListener('click', () => {
@@ -494,11 +524,432 @@ def create_app() -> Flask:
         total_delay, max_delay, whois_full = '', 0, None
 
         if request.method == 'POST':
-            # Load raw headers
+            # Determine raw headers from uploaded file or textarea
+            f = request.files.get('file')
+            if f and f.filename:
+                name = f.filename.lower()
+                data = f.read()
+                if name.endswith('.msg'):
+                    # --- .msg support via extract_msg ---
+                    import tempfile, extract_msg, os
+
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.msg')
+                    tmp.write(data)
+                    tmp.close()
+
+                    msg = extract_msg.Message(tmp.name)
+                    hdr_obj = msg.header
+
+                    # Coerce hdr_obj into a plain string
+                    if isinstance(hdr_obj, str):
+                        raw = hdr_obj
+                    elif hasattr(hdr_obj, 'as_string'):
+                        raw = hdr_obj.as_string()
+                    elif isinstance(hdr_obj, bytes):
+                        raw = hdr_obj.decode('utf-8', errors='ignore')
+                    else:
+                        raw = str(hdr_obj or '')
+
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                else:
+                    # .eml / .txt path
+                    raw = data.decode('utf-8', errors='ignore')
+            else:
+                # No file → use textarea
+                raw = request.form.get('headers', '')
+
+            # Run your parsing pipeline
+            summary = parse_summary(raw)
+            entries = parse_received(raw)
+            ips     = extract_ips(raw)
+            domains = extract_domains(raw)
+            links   = extract_links(raw)
+
+            if entries:
+                total_delay = _format_duration(sum(e['delay_secs'] for e in entries))
+                max_delay   = max(e['delay_secs'] for e in entries)
+
+            # WHOIS lookup (unchanged)
+            email_addr = parseaddr(summary.get('From',''))[1]
+            dom = email_addr.split('@',1)[1] if '@' in email_addr else None
+            if dom:
+                ext = tldextract.extract(dom)
+                whois_dom = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
+                try:
+                    w = whois.whois(whois_dom)
+                    whois_full = getattr(w, 'text', None) or '\n'.join(f"{k}: {v}" for k, v in w.items())
+                    for key, val in (('whois_created', w.creation_date),
+                                     ('whois_updated', w.updated_date)):
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                        if isinstance(val, str):
+                            try:
+                                val = date_parser.parse(val)
+                            except:
+                                val = None
+                        if hasattr(val, 'isoformat'):
+                            if val.tzinfo is None:
+                                val = val.replace(tzinfo=timezone.utc)
+                            summary[key] = val.astimezone(timezone.utc).isoformat()
+                        else:
+                            summary[key] = None
+                except Exception as e:
+                    app.logger.warning(f"WHOIS failed for {whois_dom}: {e}")
+                    summary['whois_created'] = summary['whois_updated'] = None
+
+            # Store for export
+            session['export_summary'] = summary
+            session['export_entries'] = entries
+            session['export_ips']     = ips
+            session['export_domains'] = domains
+            session['export_links']   = links
+
+        return render_template_string(
+            TEMPLATE,
+            summary=summary,
+            entries=entries,
+            ips=ips,
+            domains=domains,
+            links=links,
+            total_delay=total_delay,
+            max_delay=max_delay,
+            whois_full=whois_full
+        )
+
+    @app.route('/export/<fmt>')
+    def export(fmt):
+        summary = session.get('export_summary', {})
+        entries = session.get('export_entries', [])
+        ips     = session.get('export_ips', [])
+        domains = session.get('export_domains', [])
+        links   = session.get('export_links', [])
+
+        # CSV → ZIP
+        if fmt == 'csv':
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+                # summary.csv
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(summary.keys())
+                w.writerow(summary.values())
+                z.writestr('summary.csv', buf.getvalue())
+
+                # hops.csv
+                if entries:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(entries[0].keys())
+                    for e in entries:
+                        w.writerow(e.values())
+                    z.writestr('hops.csv', buf.getvalue())
+
+                # ips.csv
+                if ips:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(ips[0].keys())
+                    for i in ips:
+                        w.writerow(i.values())
+                    z.writestr('ips.csv', buf.getvalue())
+
+                # domains.csv
+                if domains:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(domains[0].keys())
+                    for d in domains:
+                        w.writerow(d.values())
+                    z.writestr('domains.csv', buf.getvalue())
+
+                # links.csv
+                if links:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(links[0].keys())
+                    for l in links:
+                        w.writerow(l.values())
+                    z.writestr('links.csv', buf.getvalue())
+
+            mem.seek(0)
+            return send_file(
+                mem,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='analysis_csvs.zip'
+            )
+
+        # Markdown
+        if fmt == 'md':
+            lines = ['# Mail Header Analysis', '', '## Summary', '| Field | Value |', '|---|---|']
+            for key in ['Date','From','To','Subject','DKIM','DMARC','SPF','whois_created','whois_updated']:
+                lines.append(f"| {key} | {summary.get(key,'')} |")
+            lines.append('')
+            if entries:
+                lines += ['', '## Hop Journey', '| Hop | From | By | Timestamp | Delay |', '|---|---|---|---|---|']
+                for e in entries:
+                    lines.append(f"| {e['hop']} | {e['frm']} | {e['by']} | {e['timestamp']} | {e['duration']} |")
+            lines.append('')
+            if ips:
+                lines += ['', '## Extracted IPs', '| IP | Count | Version | Type | rDNS | Country |', '|---|---|---|---|---|']
+                for i in ips:
+                    lines.append(f"| {i['address']} | {i['count']} | {i['version']} | {i['type']} | {i['rdns'] or ''} | {i['country'] or ''} |")
+            lines.append('')
+            if domains:
+                lines += ['', '## Extracted Domains', '| Domain | Count |', '|---|---|---|']
+                for d in domains:
+                    lines.append(f"| {d['domain']} | {d['count']} |")
+            lines.append('')
+            if links:
+                lines += ['', '## Extracted Links', '| Text | URL | Count |', '|---|---|---|']
+                for l in links:
+                    lines.append(f"| {l['text']} | {l['url']} | {l['count']} |")
+            md = '\n'.join(lines)
+            return Response(
+                md,
+                mimetype='text/markdown',
+                headers={'Content-Disposition':'attachment; filename=analysis.md'}
+            )
+
+        return "Unsupported format", 400
+
+    return app
+
+    app = Flask(__name__, static_folder=DATA_DIR, static_url_path='/static')
+    app.secret_key = os.urandom(24)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s'))
+    app.logger.addHandler(handler)
+    app.logger.setLevel(logging.INFO)
+
+    @app.route('/', methods=['GET', 'POST'])
+    def index():
+        summary, entries, ips, domains, links = {}, [], [], [], []
+        total_delay, max_delay, whois_full = '', 0, None
+
+        if request.method == 'POST':
+            # Load raw headers (support .msg via extract_msg)
             if 'file' in request.files and request.files['file'].filename:
-                raw = request.files['file'].read().decode('utf-8', errors='ignore')
+                f = request.files['file']
+                fname = f.filename.lower()
+                if fname.endswith('.msg'):
+                    import tempfile, extract_msg, os
+
+                    # write uploaded bytes to a temp .msg
+                    data = f.read()
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.msg')
+                    tmp.write(data)
+                    tmp.close()
+
+                    # parse the Outlook .msg
+                    msg = extract_msg.Message(tmp.name)
+                    # extract_msg.Message.header is the raw header string
+                    raw = msg.header or ''
+
+                    # clean up
+                    try: os.unlink(tmp.name)
+                    except: pass
+                else:
+                    # existing .eml / .txt handling
+                    raw = f.read().decode('utf-8', errors='ignore')
             else:
                 raw = request.form['headers']
+
+            # Parse
+            summary = parse_summary(raw)
+            entries = parse_received(raw)
+            ips     = extract_ips(raw)
+            domains = extract_domains(raw)
+            links   = extract_links(raw)
+
+            if entries:
+                total_delay = _format_duration(sum(e['delay_secs'] for e in entries))
+                max_delay   = max(e['delay_secs'] for e in entries)
+
+            # WHOIS
+            email_addr = parseaddr(summary['From'])[1]
+            dom = email_addr.split('@', 1)[1] if '@' in email_addr else None
+            if dom:
+                ext = tldextract.extract(dom)
+                whois_dom = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
+                try:
+                    w = whois.whois(whois_dom)
+                    whois_full = getattr(w, 'text', None) or '\n'.join(f"{k}: {v}" for k, v in w.items())
+                    for key, val in (('whois_created', w.creation_date),
+                                     ('whois_updated', w.updated_date)):
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                        if isinstance(val, str):
+                            try:
+                                val = date_parser.parse(val)
+                            except:
+                                val = None
+                        if hasattr(val, 'isoformat'):
+                            if val.tzinfo is None:
+                                val = val.replace(tzinfo=timezone.utc)
+                            summary[key] = val.astimezone(timezone.utc).isoformat()
+                        else:
+                            summary[key] = None
+                except Exception as e:
+                    app.logger.warning(f"WHOIS failed for {whois_dom}: {e}")
+                    summary['whois_created'] = None
+                    summary['whois_updated'] = None
+
+            # Save for export
+            session['export_summary'] = summary
+            session['export_entries'] = entries
+            session['export_ips']     = ips
+            session['export_domains'] = domains
+            session['export_links']   = links
+
+        return render_template_string(
+            TEMPLATE,
+            summary=summary,
+            entries=entries,
+            ips=ips,
+            domains=domains,
+            links=links,
+            total_delay=total_delay,
+            max_delay=max_delay,
+            whois_full=whois_full
+        )
+
+    @app.route('/export/<fmt>')
+    def export(fmt):
+        summary = session.get('export_summary', {})
+        entries = session.get('export_entries', [])
+        ips     = session.get('export_ips', [])
+        domains = session.get('export_domains', [])
+        links   = session.get('export_links', [])
+
+        # CSV → ZIP
+        if fmt == 'csv':
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+                # summary.csv
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(summary.keys())
+                w.writerow(summary.values())
+                z.writestr('summary.csv', buf.getvalue())
+
+                # hops.csv
+                if entries:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(entries[0].keys())
+                    for e in entries:
+                        w.writerow(e.values())
+                    z.writestr('hops.csv', buf.getvalue())
+
+                # ips.csv
+                if ips:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(ips[0].keys())
+                    for i in ips:
+                        w.writerow(i.values())
+                    z.writestr('ips.csv', buf.getvalue())
+
+                # domains.csv
+                if domains:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(domains[0].keys())
+                    for d in domains:
+                        w.writerow(d.values())
+                    z.writestr('domains.csv', buf.getvalue())
+
+                # links.csv
+                if links:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(links[0].keys())
+                    for l in links:
+                        w.writerow(l.values())
+                    z.writestr('links.csv', buf.getvalue())
+
+            mem.seek(0)
+            return send_file(
+                mem,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='analysis_csvs.zip'
+            )
+
+        # Markdown
+        if fmt == 'md':
+            lines = ['# Mail Header Analysis', '', '## Summary', '| Field | Value |', '|---|---|']
+            for key in ['Date','From','To','Subject','DKIM','DMARC','SPF','whois_created','whois_updated']:
+                lines.append(f"| {key} | {summary.get(key,'')} |")
+            lines.append('')
+            if entries:
+                lines += ['', '## Hop Journey', '| Hop | From | By | Timestamp | Delay |', '|---|---|---|---|---|']
+                for e in entries:
+                    lines.append(f"| {e['hop']} | {e['frm']} | {e['by']} | {e['timestamp']} | {e['duration']} |")
+            lines.append('')
+            if ips:
+                lines += ['', '## Extracted IPs', '| IP | Count | Version | Type | rDNS | Country |', '|---|---|---|---|---|---|']
+                for i in ips:
+                    lines.append(f"| {i['address']} | {i['count']} | {i['version']} | {i['type']} | {i['rdns'] or ''} | {i['country'] or ''} |")
+            lines.append('')
+            if domains:
+                lines += ['', '## Extracted Domains', '| Domain | Count |', '|---|---|---|']
+                for d in domains:
+                    lines.append(f"| {d['domain']} | {d['count']} |")
+            lines.append('')
+            if links:
+                lines += ['', '## Extracted Links', '| Text | URL | Count |', '|---|---|---|']
+                for l in links:
+                    lines.append(f"| {l['text']} | {l['url']} | {l['count']} |")
+            md = '\n'.join(lines)
+            return Response(
+                md,
+                mimetype='text/markdown',
+                headers={'Content-Disposition':'attachment; filename=analysis.md'}
+            )
+
+        return "Unsupported format", 400
+
+    return app
+
+    app = Flask(__name__, static_folder=DATA_DIR, static_url_path='/static')
+    app.secret_key = os.urandom(24)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s'))
+    app.logger.addHandler(handler)
+    app.logger.setLevel(logging.INFO)
+
+    @app.route('/', methods=['GET', 'POST'])
+    def index():
+        summary, entries, ips, domains, links = {}, [], [], [], []
+        total_delay, max_delay, whois_full = '', 0, None
+
+        if request.method == 'POST':
+            if 'file' in request.files and request.files['file'].filename:
+                f = request.files['file']
+                fname = f.filename.lower()
+                if fname.endswith('.msg'):
+                    import tempfile, extract_msg, os
+
+                    data = f.read()
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.msg')
+                    tmp.write(data)
+                    tmp.close()
+
+                    msg = extract_msg.Message(tmp.name)
+                    raw = msg.header or ''
+
+                    try: os.unlink(tmp.name)
+                    except: pass
+                else:
+                    raw = f.read().decode('utf-8', errors='ignore')
+            else:
+                # no file uploaded → use the textarea contents
+                raw = request.form.get('headers', '')
 
             # Parse
             summary = parse_summary(raw)
