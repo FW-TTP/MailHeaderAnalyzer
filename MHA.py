@@ -40,7 +40,7 @@ TEMPLATE = '''
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mail Header Analyzer v0.3</title>
+  <title>Mail Header Analyzer v0.4</title>
   <script src="{{ url_for('static', filename='tailwinds.16') }}"></script>
   <script src="{{ url_for('static', filename='chart.js') }}"></script>
 <style media="print">
@@ -81,8 +81,8 @@ TEMPLATE = '''
     <form id="analyze-form" method="post" enctype="multipart/form-data" class="mb-8"
           onsubmit="document.getElementById('loading-overlay').classList.remove('hidden')">
       <div id="drop-area" class="w-full p-4 mb-4 bg-gray-800 border-2 border-dashed border-gray-600 rounded text-center">
-              <p>Drag & Drop an .eml, .txt, or .msg file here, or click to choose</p>
-        <input type="file" name="file" id="fileElem" accept=".eml,.txt,.msg" class="hidden">
+              <p>Drag & Drop an .eml, .txt, or .msg file here</p>
+       <!-- <input type="file" name="file" id="fileElem" accept=".eml,.txt,.msg" class="hidden"> -->
       </div>
 
       <textarea id="headers" name="headers"
@@ -261,7 +261,7 @@ TEMPLATE = '''
     // Drag & Drop
     const dropArea = document.getElementById('drop-area');
     const fileElem = document.getElementById('fileElem');
-    dropArea.addEventListener('click', () => fileElem.click());
+    dropArea.addEventListener('click', e => e.preventDefault());
     ['dragenter','dragover'].forEach(e =>
       dropArea.addEventListener(e, ev => { ev.preventDefault(); dropArea.classList.add('highlight'); })
     );
@@ -1110,7 +1110,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Mail Header Analyzer')
     parser.add_argument('-d','--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('-b','--bind', default='127.0.0.1', help='Bind address')
-    parser.add_argument('-p','--port', type=int, default=8080, help='Port number')
+    parser.add_argument('-p','--port', type=int, default=5001, help='Port number')
     args = parser.parse_args()
 
     app = create_app()
