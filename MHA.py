@@ -61,7 +61,7 @@ TEMPLATE = '''
 
   <nav class="bg-gray-800 shadow">
     <div class="container mx-auto p-4 flex justify-between items-center">
-      <h1 class="text-3xl font-bold text-orange-500">Mail Header Analyzer v0.3</h1>
+      <h1 class="text-3xl font-bold text-orange-500">Mail Header Analyzer v0.4</h1>
       <div class="space-x-2 relative">
         <button id="export-btn" class="px-4 py-2 bg-orange-500 text-gray-900 rounded hover:bg-orange-600">Export ▼</button>
         <ul id="export-menu" class="absolute right-0 mt-2 w-40 bg-gray-800 border border-gray-700 rounded shadow-lg hidden">
